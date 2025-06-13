@@ -7,15 +7,6 @@ from linebot.models import (
     PostbackEvent, TemplateSendMessage, ButtonsTemplate, CarouselTemplate,
     CarouselColumn, URIAction, PostbackAction
 )
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from wordcloud import WordCloud
-from collections import defaultdict, Counter
-import seaborn as sns
-import re
-import tempfile
-import shutil
 import json
 import random
 import os
@@ -45,6 +36,86 @@ if os.path.exists(FAVORITES_FILE):
         user_favorites = json.load(f)
 else:
     user_favorites = {}
+
+def parse_price(price_str):
+    try:
+        if "免費" in price_str:
+            return 0
+        numbers = ''.join(c for c in price_str if c.isdigit())
+        return int(numbers)
+    except:
+        return 999999
+
+def check_game_updates():
+    last_file = 'all_games_last.json'
+    current_file = 'all_games.json'
+
+    if not os.path.exists(last_file):
+        with open(current_file, 'r', encoding='utf-8') as f:
+            data = f.read()
+        with open(last_file, 'w', encoding='utf-8') as f:
+            f.write(data)
+        return
+
+    with open(last_file, 'r', encoding='utf-8') as f:
+        last_data = json.load(f)
+    with open(current_file, 'r', encoding='utf-8') as f:
+        current_data = json.load(f)
+
+    last_games = {game['game_name']: game for game in last_data}
+    current_games = {game['game_name']: game for game in current_data}
+
+    # 新遊戲偵測
+    new_games = [game for name, game in current_games.items() if name not in last_games]
+    for user_id in user_favorites:
+        if new_games:
+            # 先送出一則提示文字
+            line_bot_api.push_message(user_id, TextSendMessage(
+                text="有新遊戲呢！要不要來看看呀？>U<"
+            ))
+        for game in new_games:
+            s_template = ButtonsTemplate(
+                thumbnail_image_url=game['game_image'],
+                title=game['game_name'][:40],
+                text=f"價格：{game['original_price']}",
+                actions=[
+                    URIAction(label='遊戲連結', uri=game['link']),
+                    PostbackAction(label='加入我的最愛', data=f"action=add_favorite&game_name={game['game_name']}")
+                ]
+            )
+            line_bot_api.push_message(user_id, TemplateSendMessage(
+                alt_text="有新遊戲耶～", template=s_template
+            ))
+
+    
+    # 降價通知
+    for user_id, favorites in user_favorites.items():
+        sent_notice = False
+        for fav_name in favorites:
+            if fav_name in last_games and fav_name in current_games:
+                old_price = parse_price(last_games[fav_name]['original_price'])
+                new_price = parse_price(current_games[fav_name]['original_price'])
+                if new_price < old_price:
+                    game = current_games[fav_name]  # ✅ 加上這行
+                    line_bot_api.push_message(user_id, TextSendMessage(
+                        text=f"🎉《{fav_name}》降價啦！\n💰 原價：NT$ {old_price}\n🔥 現在只要：NT$ {new_price}！"
+                    ))
+                    s_template = ButtonsTemplate(
+                        thumbnail_image_url=game['game_image'],
+                        title=game['game_name'][:40],
+                        text=f"現在價格：{game['original_price']}",
+                        actions=[
+                            URIAction(label='遊戲連結', uri=game['link']),
+                            PostbackAction(label='加入我的最愛', data=f"action=add_favorite&game_name={game['game_name']}")
+                        ]
+                    )
+                    line_bot_api.push_message(user_id, TemplateSendMessage(
+                        alt_text=f"《{fav_name}》降價通知", template=s_template
+                    ))
+
+    # 寫入新的 last
+    with open(last_file, 'w', encoding='utf-8') as f:
+        json.dump(current_data, f, ensure_ascii=False, indent=2)
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -200,23 +271,6 @@ def handle_text_message(event):
         user_search_state[user_id] = {"step": None, "data": {}}
         return
         
-    elif user_message == "生成圖表":
-        buttons_template = ButtonsTemplate(
-            title="選擇圖片類型",
-            text="請選擇要生成的統計圖：",
-            actions=[
-                PostbackAction(label="歷年發行數量", data="image=release_by_year"),
-                PostbackAction(label="熱門標籤長條圖", data="image=top_tags_bar"),
-                PostbackAction(label="標籤文字雲", data="image=tags_wordcloud"),
-                PostbackAction(label="價格分布圖", data="image=price_scatter")
-            ]
-        )
-        line_bot_api.reply_message(
-            event.reply_token,
-            TemplateSendMessage(alt_text="選擇圖片類型", template=buttons_template)
-        )
-        return
-    
     elif user_message == "我的最愛":
         favorites = user_favorites.get(user_id, [])
 
@@ -321,99 +375,7 @@ def filter_and_reply_games(event, user_id):
     # 設定下一步等使用者輸入精確名稱
     state["step"] = "wait_exact_game_name"
     state["data"]["candidates"] = filtered  # 暫存候選遊戲清單
-        
-def generate_chart(chart_type):
-    try:
-        plt.clf()
-        temp_dir = tempfile.mkdtemp()
-        img_path = os.path.join(temp_dir, f"{chart_type}.png")
-
-        if chart_type == "release_by_year":
-            year_counts = Counter()
-            for g in games:
-                release_date = g.get("release_date", "").strip()
-                if release_date:
-                    match = re.search(r"\d{4}", release_date)
-                    if match:
-                        year_counts[match.group()] += 1
-            years = sorted(year_counts.keys())
-            counts = [year_counts[y] for y in years]
-            plt.figure(figsize=(10, 6))
-            sns.barplot(x=years, y=counts)
-            plt.xticks(rotation=45)
-            plt.title("歷年發行數量")
-            plt.tight_layout()
-
-        elif chart_type == "top_tags_bar":
-            tag_counter = Counter()
-            for g in games:
-                tag_str = g.get("tag", "")
-                if tag_str.strip():
-                    tags = tag_str.split(",")
-                    tag_counter.update([t.strip() for t in tags if t.strip()])
-            top_tags = tag_counter.most_common(10)
-            if top_tags:
-                tags, counts = zip(*top_tags)
-                plt.figure(figsize=(10, 6))
-                sns.barplot(x=counts, y=tags)
-                plt.title("熱門標籤前十名")
-                plt.tight_layout()
-
-        elif chart_type == "tags_wordcloud":
-            tag_counter = Counter()
-            for g in games:
-                tag_str = g.get("tag", "")
-                if tag_str.strip():
-                    tags = tag_str.split(",")
-                    tag_counter.update([t.strip() for t in tags if t.strip()])
-            if tag_counter:
-                wc = WordCloud(font_path='NotoSansTC-Regular.otf', background_color='white', width=800, height=400)
-                wc.generate_from_frequencies(tag_counter)
-                plt.figure(figsize=(10, 6))
-                plt.imshow(wc, interpolation='bilinear')
-                plt.axis('off')
-
-        elif chart_type == "price_scatter":
-            prices = []
-            for g in games:
-                price_str = g.get("original_price", "")
-                if price_str.strip():
-                    try:
-                        price = float(price_str.replace("NT$", "").strip())
-                        prices.append(price)
-                    except:
-                        continue
-            if prices:
-                plt.figure(figsize=(10, 6))
-                sns.histplot(prices, bins=20)
-                plt.title("價格分布圖")
-                plt.xlabel("價格（NT$）")
-                plt.tight_layout()
-
-        else:
-            return None
-
-        # 儲存圖片
-        plt.savefig(img_path)
-
-        # 準備公開網址
-        public_path = f"/static/{os.path.basename(img_path)}"
-        os.makedirs("static", exist_ok=True)
-        shutil.copy(img_path, f"static/{os.path.basename(img_path)}")
-
-        full_url = request.host_url.rstrip('/') + public_path
-        print(f"🔍 產生的圖片 URL：{full_url}")
-
-        # 檢查是否為 HTTPS
-        if not full_url.startswith("https://"):
-            print("⚠️ 錯誤：LINE 圖片網址必須是 HTTPS 公開網址")
-
-        return request.host_url.rstrip('/') + public_path
-
-    except Exception as e:
-        print(f"Error generating chart: {e}")
-        return None
-
+    
 def save_favorites():
     with open(FAVORITES_FILE, 'w', encoding='utf-8') as f:
         json.dump(user_favorites, f, ensure_ascii=False, indent=2)
@@ -427,22 +389,6 @@ def handle_postback(event):
     if user_id not in user_search_state:
         user_search_state[user_id] = {"step": None, "data": {}}
     state = user_search_state[user_id]
-
-    # 處理圖表生成
-    if data.startswith("image="):
-        image_type = data.split("=")[1]
-        img_path = generate_chart(image_type)
-        if img_path:
-            line_bot_api.reply_message(
-                event.reply_token,
-                ImageSendMessage(original_content_url=img_path, preview_image_url=img_path)
-            )
-        else:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="生成圖片失敗，請稍後再試～")
-            )
-        return
 
     # ✅ 加入最愛
     if params.get('action') == 'add_favorite':
@@ -547,6 +493,7 @@ def delete_history():
     return {"message": "對話紀錄已刪除"}
 
 if __name__ == "__main__":
+    check_game_updates()  # 啟動時檢查有沒有新遊戲或降價
     import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
